@@ -3,6 +3,10 @@
 #include <ESP8266WiFi.h>        // Include the Wi-Fi library
 #include <PubSubClient.h>
 
+#include "fk.h"
+#include "ik.h"
+#include "meArm.h"
+
 // secrets.ino
 extern const char* ssid;     // The SSID (name) of the Wi-Fi network you want to connect to
 extern const char* password; // The password of the Wi-Fi network
@@ -20,6 +24,8 @@ const int s_pin[sn] = {13, 12, 14, 16};
 
 Ticker ticker;
 
+ServoInfo base, shoulder, elbow, gripper;
+
 /*
  * Position range is -100..100 = -90 deg..90 deg
  * Max speed is 1.5ms per position.
@@ -29,28 +35,80 @@ Ticker ticker;
  * position is stored in us (sent to servo)
  * speed is position difference per 20ms
  */
-const int max_speed = 140;
-int current_position[sn];
-int target_position[sn];
-int speed_limit[sn] = {max_speed,max_speed,max_speed,max_speed};
+float max_speed = 10.0f;
+float current_position[3];
+float target_position[3];
+float speed_limit = max_speed;
+
+bool vec_eq(float a[], float b[]) {
+  for (int i = 0; i < 3; ++i) {
+    if (a[i] != b[i])
+      return false;
+  }
+  return true;
+}
+
+void vec_assign(float a[], float b[]) {
+  for (int i = 0; i < 3; ++i) {
+    a[i] = b[i];
+  }
+}
+
+void scale(float a[], float s) {
+  for (int i = 0; i < 3; ++i) {
+    a[i] *= s;
+  }
+}
+
+/*
+ *     
+    float x, y, z;
+    solve(0.0f,228.0f,0.0f,x,y,z); // fully forward
+    printf("%f %f %f\n", x*180/PI, y*180/PI, z*180/PI);
+    
+    solve(-228.0f,0.0f,0.0f,x,y,z); // fully left
+    printf("%f %f %f\n", x*180/PI, y*180/PI, z*180/PI);
+
+    solve(228.0f,0.0f,0.0f,x,y,z); // fully right
+    printf("%f %f %f\n", x*180/PI, y*180/PI, z*180/PI);
+
+    solve(0.0f,68.0f,160.0f,x,y,z); // fully up
+    printf("%f %f %f\n", x*180/PI, y*180/PI, z*180/PI);
+ */
 
 void update_servos() {
-  for (int i = 0; i < sn; ++i) {
-    int diff = target_position[i]-current_position[i];
-    if (diff != 0) {
-      if (diff > 0) {
-        if (diff > speed_limit[i]) {
-          diff = speed_limit[i];
-        }
-      } else {
-        if (diff < -speed_limit[i]) {
-          diff = -speed_limit[i];
-        }
-      }
-      current_position[i] += diff;
-      s[i].writeMicroseconds(DEFAULT_PULSE_WIDTH + current_position[i]);
+  if (!vec_eq(current_position, target_position)) {
+    float a[3]; // base, shoulder, elbow
+    if (solve(target_position, a)) {
+      scale(a, 200/PI);
+      Serial.print(a[0]);
+      Serial.print(',');
+      Serial.print(a[1]);
+      Serial.print(',');
+      Serial.print(a[2]);
+      Serial.println();
+    } else {
+      Serial.println("can't solve");
     }
+    vec_assign(current_position, target_position);
   }
+  
+//  for (int i = 0; i < sn; ++i) {
+//    int diff = target_position[i]-current_position[i];
+//    if (diff != 0) {
+//      if (diff > 0) {
+//        if (diff > speed_limit[i]) {
+//          diff = speed_limit[i];
+//        }
+//      } else {
+//        if (diff < -speed_limit[i]) {
+//          diff = -speed_limit[i];
+//        }
+//      }
+//      current_position[i] += diff;
+//      s[i].writeMicroseconds(DEFAULT_PULSE_WIDTH + current_position[i]);
+//    }
+//  }
 }
 
 String inputString = "";
@@ -84,8 +142,15 @@ void setup() {
   Serial.print("IP address:\t");
   Serial.println(WiFi.localIP());           // Send the IP address of the ESP8266 to the computer
 
+  // Servo callibration data
+  setup_servo(base, 145, 49, -PI/4, PI/4);
+  setup_servo(shoulder, 118, 22, -PI/4, 3*PI/4);
+  setup_servo(elbow, 144, 36, PI/4, -PI/4);
+  setup_servo(gripper, 75, 49, PI/2, 0);
+
   client.setServer(mqttServer, mqttPort);
   client.setCallback(mqtt_callback);
+
 }
 
 void reconnect() {
@@ -118,40 +183,23 @@ void loop() {
   client.loop();
   
   if (stringComplete) {
-    int servo_no = inputString[0] - 'A';
-    int separator = inputString.indexOf(',');
-
-    int pos = inputString.substring(1).toInt();
-    target_position[servo_no] = 10*pos; //position is stored in us (sent to servo)
-    
-    int sp;
-    if (separator > 0) {
-      sp = inputString.substring(separator+1).toInt();
-    } else {
-      sp = max_speed;
-    }
-    speed_limit[servo_no] = sp;
-
-    log_servo_request(servo_no, pos, sp);
-
+    Serial.println(inputString);
     inputString = "";
     stringComplete = false;
   }
 }
 
-
+short data[4];
 void mqtt_callback(char* topic, unsigned char* payload, unsigned int length) {
-  if (length == 2*sn) {
-    for (int i = 0; i < sn; ++i) {
-      unsigned char *data = payload + 2*i;
-      int pos = (signed char)data[0]; // force signed
-      int sp = data[1];
-
-      target_position[i] = 10*pos;
-      speed_limit[i] = sp;
-
-      log_servo_request(i, pos, sp);
+  if (length == 4*sizeof(short)) {
+    memcpy((void *)data, (void *)payload, 4*sizeof(short));
+    for (int i = 0; i < 3; ++i) {
+      target_position[i] = data[i]*0.1f;
+      Serial.print(data[i], DEC);
+      Serial.print(',');
     }
+    speed_limit = data[3]*0.1f;
+    Serial.println(data[3], DEC);
   }
 }
 
