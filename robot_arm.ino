@@ -2,6 +2,7 @@
 #include <Ticker.h>
 #include <ESP8266WiFi.h>        // Include the Wi-Fi library
 #include <PubSubClient.h>
+#include <Math.h>
 
 #include "fk.h"
 #include "ik.h"
@@ -20,7 +21,12 @@ PubSubClient client(espClient);
 
 const uint8_t sn = 4;
 Servo s[sn];
-const int s_pin[sn] = {13, 12, 14, 16};
+
+// base: 98 -> -PI/2, 102 -> PI/2
+// shoulder: 100 -> 0, -70 -> 170/200*PI (15 -> PI/2)
+// elbow: -54 -> ?, 98 -> ? (-46 -> PI/2)
+// gripper: 16 -> 0, -40 -> PI
+const int s_pin[sn] = {12, 13, 16, 14};
 
 Ticker ticker;
 
@@ -35,17 +41,42 @@ ServoInfo base, shoulder, elbow, gripper;
  * position is stored in us (sent to servo)
  * speed is position difference per 20ms
  */
-float max_speed = 10.0f;
-float current_position[3];
-float target_position[3];
+float max_speed = 10.0f; // TODO
+float current_position[3] = {0, 100, 50}; // x, y, z
+float target_position[3] = {0, 100, 50};
 float speed_limit = max_speed;
+
+// separate command for gripper
+short current_gripper = 90;
+short target_gripper = 90;
+short gripper_speed_limit = 180;
 
 bool vec_eq(float a[], float b[]) {
   for (int i = 0; i < 3; ++i) {
-    if (a[i] != b[i])
+    if (a[i] != b[i]) // up to delta?
       return false;
   }
   return true;
+}
+
+void vec_mul_scalar(float a[], float s) {
+  for (int i = 0; i < 3; ++i) {
+    a[i] *= s;
+  }
+}
+
+float vec_len(float a[]) {
+  float d = 0.0f;
+  for (int i = 0; i < 3; ++i) {
+    d += a[i]*a[i];
+  }
+  return sqrt(d);
+}
+
+float vec_sub(float a[], float b[], float c[]) {
+  for (int i = 0; i < 3; ++i) {
+    a[i] = b[i]-c[i];
+  }
 }
 
 void vec_assign(float a[], float b[]) {
@@ -54,61 +85,73 @@ void vec_assign(float a[], float b[]) {
   }
 }
 
-void scale(float a[], float s) {
+float vec_add(float a[], float b[], float c[]) {
   for (int i = 0; i < 3; ++i) {
-    a[i] *= s;
+    a[i] = b[i]+c[i];
   }
 }
 
-/*
- *     
-    float x, y, z;
-    solve(0.0f,228.0f,0.0f,x,y,z); // fully forward
-    printf("%f %f %f\n", x*180/PI, y*180/PI, z*180/PI);
-    
-    solve(-228.0f,0.0f,0.0f,x,y,z); // fully left
-    printf("%f %f %f\n", x*180/PI, y*180/PI, z*180/PI);
+void set_position(float pos[3]) {
+  float a[3];
+  int us[3];
 
-    solve(228.0f,0.0f,0.0f,x,y,z); // fully right
-    printf("%f %f %f\n", x*180/PI, y*180/PI, z*180/PI);
+//  Serial.print("pos:");
+//  Serial.print(pos[0]);
+//  Serial.print(' ');
+//  Serial.print(pos[1]);
+//  Serial.print(' ');
+//  Serial.println(pos[2]);
 
-    solve(0.0f,68.0f,160.0f,x,y,z); // fully up
-    printf("%f %f %f\n", x*180/PI, y*180/PI, z*180/PI);
- */
+  if (solve(pos, a)) {
+//    Serial.print("a:");
+//    Serial.print(a[0]);
+//    Serial.print(' ');
+//    Serial.print(a[1]);
+//    Serial.print(' ');
+//    Serial.println(a[2]);
+
+    us[0] = angle2pwm(base,     a[0]);
+    us[1] = angle2pwm(shoulder, a[1]);
+    us[2] = angle2pwm(elbow,    a[2]);
+//    Serial.print("us:");
+//    Serial.print(us[0]);
+//    Serial.print(' ');
+//    Serial.print(us[1]);
+//    Serial.print(' ');
+//    Serial.println(us[2]);
+
+    s[0].writeMicroseconds(DEFAULT_PULSE_WIDTH + us[0]);
+    s[1].writeMicroseconds(DEFAULT_PULSE_WIDTH + us[1]);
+    s[2].writeMicroseconds(DEFAULT_PULSE_WIDTH + us[2]);
+  } else {
+    Serial.println("CS");
+  }
+}
 
 void update_servos() {
+  float delta[3]; // base, shoulder, elbow
+
   if (!vec_eq(current_position, target_position)) {
-    float a[3]; // base, shoulder, elbow
-    if (solve(target_position, a)) {
-      scale(a, 200/PI);
-      Serial.print(a[0]);
-      Serial.print(',');
-      Serial.print(a[1]);
-      Serial.print(',');
-      Serial.print(a[2]);
-      Serial.println();
-    } else {
-      Serial.println("can't solve");
+//    vec_assign(current_position, target_position);
+//    set_position(current_position);
+    vec_sub(delta, target_position, current_position); // delta = target_position - current_position
+    float dist = vec_len(delta);
+    if (dist > speed_limit) {
+      vec_mul_scalar(delta, speed_limit/dist);
     }
-    vec_assign(current_position, target_position);
+    vec_add(current_position, current_position, delta);
+    set_position(current_position);
   }
-  
-//  for (int i = 0; i < sn; ++i) {
-//    int diff = target_position[i]-current_position[i];
-//    if (diff != 0) {
-//      if (diff > 0) {
-//        if (diff > speed_limit[i]) {
-//          diff = speed_limit[i];
-//        }
-//      } else {
-//        if (diff < -speed_limit[i]) {
-//          diff = -speed_limit[i];
-//        }
-//      }
-//      current_position[i] += diff;
-//      s[i].writeMicroseconds(DEFAULT_PULSE_WIDTH + current_position[i]);
-//    }
-//  }
+
+  if (current_gripper != target_gripper) {
+    float dist = target_gripper - current_gripper;
+    if (abs(dist) > gripper_speed_limit) {
+      dist *= speed_limit/abs(dist);
+    }
+    current_gripper += dist;
+    float pwm = angle2pwm(gripper, current_gripper*PI/180.0f); // deg2rad
+    s[3].writeMicroseconds(DEFAULT_PULSE_WIDTH + pwm);
+  }
 }
 
 String inputString = "";
@@ -123,6 +166,14 @@ void setup() {
     s[i].attach(s_pin[i]);
   }
 
+  // Servo callibration data (see servo.ods)
+  setup_servo(base,      980, -1020, -1.5707963268f, 1.5707963268f);
+  setup_servo(shoulder, 1000,  -700,  0.0f,          2.6703537556f);
+  setup_servo(elbow,    -540,   980, -1.6964600329f, 0.6911503838f);
+  setup_servo(gripper,   160,  -400,  PI,         0);
+
+  set_position(current_position);
+  
   ticker.attach_ms(20, update_servos);
 
   WiFi.softAPdisconnect(true); // no AP
@@ -141,12 +192,6 @@ void setup() {
   Serial.println(WiFi.SSID());              // Tell us what network we're connected to
   Serial.print("IP address:\t");
   Serial.println(WiFi.localIP());           // Send the IP address of the ESP8266 to the computer
-
-  // Servo callibration data
-  setup_servo(base, 145, 49, -PI/4, PI/4);
-  setup_servo(shoulder, 118, 22, -PI/4, 3*PI/4);
-  setup_servo(elbow, 144, 36, PI/4, -PI/4);
-  setup_servo(gripper, 75, 49, PI/2, 0);
 
   client.setServer(mqttServer, mqttPort);
   client.setCallback(mqtt_callback);
@@ -191,24 +236,23 @@ void loop() {
 
 short data[4];
 void mqtt_callback(char* topic, unsigned char* payload, unsigned int length) {
-  if (length == 4*sizeof(short)) {
-    memcpy((void *)data, (void *)payload, 4*sizeof(short));
+  if (length == 4*sizeof(short)) { // move
+    memcpy((void *)data, (void *)payload, length);
     for (int i = 0; i < 3; ++i) {
-      target_position[i] = data[i]*0.1f;
-      Serial.print(data[i], DEC);
+      target_position[i] = data[i];
+      Serial.print(data[i]);
       Serial.print(',');
     }
     speed_limit = data[3]*0.1f;
-    Serial.println(data[3], DEC);
+    Serial.println(data[3]);
+  } else if (length == 2*sizeof(short)) { // grip
+    memcpy((void *)data, (void *)payload, length);
+    target_gripper = data[0];
+    gripper_speed_limit = data[1];
+    Serial.print(data[0]);
+    Serial.print(',');
+    Serial.println(data[1]);
   }
-}
-
-void log_servo_request(int servo_no, int pos, int sp) {
-  Serial.print((char)('A'+servo_no));
-  Serial.print(':');
-  Serial.print(pos);
-  Serial.print(',');
-  Serial.println(sp);
 }
 
 void serialEvent() {
