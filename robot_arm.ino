@@ -122,11 +122,12 @@ void set_grip(float current_gripper) {
 uint32_t last_updated;
 bool update_needed = false;
 
-const uint32_t UPDATE_INTERNAL = 20000;
+const uint32_t UPDATE_INTERNAL_US = 20000;
+const uint32_t UPDATE_INTERNAL = microsecondsToClockCycles(20000);
 uint32_t update_servos_irq() {
   uint32_t now = ESP.getCycleCount();
   uint32_t us = clockCyclesToMicroseconds(now - last_updated);
-  if (us >= UPDATE_INTERNAL) {
+  if (us >= UPDATE_INTERNAL_US) {
     // just set servo positions
     s[0].writeMicroseconds(s_values[0]);
     s[1].writeMicroseconds(s_values[1]);
@@ -135,7 +136,7 @@ uint32_t update_servos_irq() {
     last_updated = now;
     update_needed = true;
   }
-  return microsecondsToClockCycles(UPDATE_INTERNAL) - (now - last_updated);
+  return UPDATE_INTERNAL - (now - last_updated);
 }
 
 void update_servos() {
@@ -256,8 +257,8 @@ void loop() {
 
 short data[4];
 void mqtt_callback(char* topic, unsigned char* payload, unsigned int length) {
-  if (length == 4*sizeof(short)) { // move
-    memcpy((void *)data, (void *)payload, length);
+  if (payload[0] == (unsigned char) CommandType::MOVE) {
+    memcpy((void *)data, (void *)(payload+1), length-1);
     for (int i = 0; i < 3; ++i) {
       target_position[i] = data[i];
       Serial.print(data[i]);
@@ -265,8 +266,8 @@ void mqtt_callback(char* topic, unsigned char* payload, unsigned int length) {
     }
     speed_limit = data[3]*0.1f;
     Serial.println(data[3]);
-  } else if (length == 2*sizeof(short)) { // grip
-    memcpy((void *)data, (void *)payload, length);
+  } else if (payload[0] == (unsigned char) CommandType::GRIP) {
+    memcpy((void *)data, (void *)(payload+1), length-1);
     target_gripper = data[0];
     gripper_speed_limit = data[1];
     Serial.print(data[0]);
