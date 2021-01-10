@@ -1,8 +1,9 @@
 #include <Servo.h>
-#include <Ticker.h>
+#include <core_esp8266_waveform.h>
 #include <ESP8266WiFi.h>        // Include the Wi-Fi library
 #include <PubSubClient.h>
 #include <Math.h>
+#include <Esp.h>
 
 #include "fk.h"
 #include "ik.h"
@@ -27,8 +28,15 @@ Servo s[sn];
 // elbow: -54 -> ?, 98 -> ? (-46 -> PI/2)
 // gripper: 16 -> 0, -40 -> PI
 const int s_pin[sn] = {12, 13, 16, 14};
+int s_values[sn];
 
-Ticker ticker;
+enum CommandType {
+  READ = 0, // TODO read current position
+  MOVE, // move to position with constant speed
+  GRIP, // change gripper position
+  MOVE_SEQ, // TODO sequence of positions (every 20 ms) [what about gripper?]
+  SERVO_SEQ // TODO sequence of direct servo positions (every 20 ms)
+};
 
 ServoInfo base, shoulder, elbow, gripper;
 
@@ -41,10 +49,9 @@ ServoInfo base, shoulder, elbow, gripper;
  * position is stored in us (sent to servo)
  * speed is position difference per 20ms
  */
-float max_speed = 10.0f; // TODO
 float current_position[3] = {0, 100, 50}; // x, y, z
 float target_position[3] = {0, 100, 50};
-float speed_limit = max_speed;
+float speed_limit = 0.0f;
 
 // separate command for gripper
 short current_gripper = 90;
@@ -95,62 +102,67 @@ void set_position(float pos[3]) {
   float a[3];
   int us[3];
 
-//  Serial.print("pos:");
-//  Serial.print(pos[0]);
-//  Serial.print(' ');
-//  Serial.print(pos[1]);
-//  Serial.print(' ');
-//  Serial.println(pos[2]);
-
   if (solve(pos, a)) {
-//    Serial.print("a:");
-//    Serial.print(a[0]);
-//    Serial.print(' ');
-//    Serial.print(a[1]);
-//    Serial.print(' ');
-//    Serial.println(a[2]);
-
     us[0] = angle2pwm(base,     a[0]);
     us[1] = angle2pwm(shoulder, a[1]);
     us[2] = angle2pwm(elbow,    a[2]);
-//    Serial.print("us:");
-//    Serial.print(us[0]);
-//    Serial.print(' ');
-//    Serial.print(us[1]);
-//    Serial.print(' ');
-//    Serial.println(us[2]);
-
-    s[0].writeMicroseconds(DEFAULT_PULSE_WIDTH + us[0]);
-    s[1].writeMicroseconds(DEFAULT_PULSE_WIDTH + us[1]);
-    s[2].writeMicroseconds(DEFAULT_PULSE_WIDTH + us[2]);
+    s_values[0] = DEFAULT_PULSE_WIDTH + us[0];
+    s_values[1] = DEFAULT_PULSE_WIDTH + us[1];
+    s_values[2] = DEFAULT_PULSE_WIDTH + us[2];
   } else {
     Serial.println("CS");
   }
 }
 
-void update_servos() {
-  float delta[3]; // base, shoulder, elbow
+void set_grip(float current_gripper) {
+  float pwm = angle2pwm(gripper, current_gripper*PI/180.0f); // deg2rad
+  s_values[3] = DEFAULT_PULSE_WIDTH + pwm;
+}
 
-  if (!vec_eq(current_position, target_position)) {
-//    vec_assign(current_position, target_position);
-//    set_position(current_position);
-    vec_sub(delta, target_position, current_position); // delta = target_position - current_position
-    float dist = vec_len(delta);
-    if (dist > speed_limit) {
-      vec_mul_scalar(delta, speed_limit/dist);
-    }
-    vec_add(current_position, current_position, delta);
-    set_position(current_position);
+uint32_t last_updated;
+bool update_needed = false;
+
+const uint32_t UPDATE_INTERNAL = 20000;
+uint32_t update_servos_irq() {
+  uint32_t now = ESP.getCycleCount();
+  uint32_t us = clockCyclesToMicroseconds(now - last_updated);
+  if (us >= UPDATE_INTERNAL) {
+    // just set servo positions
+    s[0].writeMicroseconds(s_values[0]);
+    s[1].writeMicroseconds(s_values[1]);
+    s[2].writeMicroseconds(s_values[2]);
+    s[3].writeMicroseconds(s_values[3]);
+    last_updated = now;
+    update_needed = true;
   }
+  return microsecondsToClockCycles(UPDATE_INTERNAL) - (now - last_updated);
+}
 
-  if (current_gripper != target_gripper) {
-    float dist = target_gripper - current_gripper;
-    if (abs(dist) > gripper_speed_limit) {
-      dist *= speed_limit/abs(dist);
+void update_servos() {
+  // calculate servo positions for the next frame
+  if (update_needed) {
+    float delta[3]; // base, shoulder, elbow
+  
+    if (!vec_eq(current_position, target_position)) {
+      vec_sub(delta, target_position, current_position); // delta = target_position - current_position
+      float dist = vec_len(delta);
+      if (dist > speed_limit) {
+        vec_mul_scalar(delta, speed_limit/dist);
+      }
+      vec_add(current_position, current_position, delta);
+      set_position(current_position);
     }
-    current_gripper += dist;
-    float pwm = angle2pwm(gripper, current_gripper*PI/180.0f); // deg2rad
-    s[3].writeMicroseconds(DEFAULT_PULSE_WIDTH + pwm);
+  
+    if (current_gripper != target_gripper) {
+      float dist = target_gripper - current_gripper;
+      if (abs(dist) > gripper_speed_limit) {
+        dist *= speed_limit/abs(dist);
+      }
+      current_gripper += dist;
+      set_grip(current_gripper);
+    }
+
+    update_needed = false;
   }
 }
 
@@ -158,10 +170,32 @@ String inputString = "";
 bool stringComplete = false;
 
 void setup() {
+  // INIT serial communication
   Serial.begin(115200);
   Serial.println('\n');
   inputString.reserve(100);
 
+  // INIT WiFi
+  WiFi.softAPdisconnect(true); // no AP
+  WiFi.begin(ssid, password);  // Connect to the network
+  Serial.print("Connecting to ");
+  Serial.print(ssid); Serial.println(" ...");
+  int i = 0;
+  while (WiFi.status() != WL_CONNECTED) { // Wait for the Wi-Fi to connect
+    delay(1000);
+    Serial.print(++i); Serial.print(", ");
+  }
+  Serial.println('\n');
+  Serial.print("Connected to ");
+  Serial.println(WiFi.SSID());              // Tell us what network we're connected to
+  Serial.print("IP address:\t");
+  Serial.println(WiFi.localIP());           // Send the IP address of the ESP8266 to the computer
+
+  // INIT MQTT
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(mqtt_callback);
+
+  // INIT servos
   for (size_t i = 0; i < sn; ++i) {
     s[i].attach(s_pin[i]);
   }
@@ -173,29 +207,10 @@ void setup() {
   setup_servo(gripper,   160,  -400,  PI,         0);
 
   set_position(current_position);
+  set_grip(current_gripper);
   
-  ticker.attach_ms(20, update_servos);
-
-  WiFi.softAPdisconnect(true); // no AP
-  WiFi.begin(ssid, password);  // Connect to the network
-  Serial.print("Connecting to ");
-  Serial.print(ssid); Serial.println(" ...");
-
-  int i = 0;
-  while (WiFi.status() != WL_CONNECTED) { // Wait for the Wi-Fi to connect
-    delay(1000);
-    Serial.print(++i); Serial.print(", ");
-  }
-
-  Serial.println('\n');
-  Serial.print("Connected to ");
-  Serial.println(WiFi.SSID());              // Tell us what network we're connected to
-  Serial.print("IP address:\t");
-  Serial.println(WiFi.localIP());           // Send the IP address of the ESP8266 to the computer
-
-  client.setServer(mqttServer, mqttPort);
-  client.setCallback(mqtt_callback);
-
+  //ticker.attach_ms(20, update_servos);
+  setTimer1Callback(update_servos_irq);
 }
 
 void reconnect() {
@@ -218,20 +233,25 @@ void reconnect() {
 }
 
 void loop() {
+  // check serial port events
   if (Serial.available() > 0) {
     serialEvent();
   }
 
-  while (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
-  
+  // serial port commands handling
   if (stringComplete) {
     Serial.println(inputString);
     inputString = "";
     stringComplete = false;
   }
+
+  // check MQTT events
+  while (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  update_servos();
 }
 
 short data[4];
