@@ -31,11 +31,10 @@ const int s_pin[sn] = {12, 13, 16, 14};
 int s_values[sn];
 
 enum CommandType {
-  READ = 0, // TODO read current position
+  READ = 0, // read current position
   MOVE, // move to position with constant speed
   GRIP, // change gripper position
-  MOVE_SEQ, // TODO sequence of positions (every 20 ms) [what about gripper?]
-  SERVO_SEQ // TODO sequence of direct servo positions (every 20 ms)
+  MOVE_SEQ // TODO sequence of positions (every 20 ms) [what about gripper?]
 };
 
 ServoInfo base, shoulder, elbow, gripper;
@@ -139,10 +138,16 @@ uint32_t update_servos_irq() {
   return UPDATE_INTERNAL - (now - last_updated);
 }
 
+bool in_move = false;
+bool publish_position = false;
+
 void update_servos() {
   // calculate servo positions for the next frame
   if (update_needed) {
     float delta[3]; // base, shoulder, elbow
+
+    bool moving = false;
+    bool gripping = false;
   
     if (!vec_eq(current_position, target_position)) {
       vec_sub(delta, target_position, current_position); // delta = target_position - current_position
@@ -152,6 +157,8 @@ void update_servos() {
       }
       vec_add(current_position, current_position, delta);
       set_position(current_position);
+      in_move = true;
+      moving = true;
     }
   
     if (current_gripper != target_gripper) {
@@ -161,6 +168,14 @@ void update_servos() {
       }
       current_gripper += dist;
       set_grip(current_gripper);
+      in_move = true;
+      gripping = true;
+    }
+
+    if (in_move && !moving && !gripping) {
+      // finished moving
+      publish_position = true;
+      in_move = false;
     }
 
     update_needed = false;
@@ -222,7 +237,7 @@ void reconnect() {
     if (client.connect("robot_arm", mqttUser, mqttPassword)) {
       Serial.println("connected");
       // Subscribe interesting topics
-      client.subscribe("robot_arm");
+      client.subscribe("robot_arm/i");
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -233,6 +248,7 @@ void reconnect() {
   }
 }
 
+short pub_data[4];
 void loop() {
   // check serial port events
   if (Serial.available() > 0) {
@@ -251,13 +267,23 @@ void loop() {
     reconnect();
   }
   client.loop();
+  if (publish_position) {
+    pub_data[0] = (short)current_position[0];
+    pub_data[1] = (short)current_position[1];
+    pub_data[2] = (short)current_position[2];
+    pub_data[3] = (short)current_gripper;
+    client.publish("robot_arm/o", (uint8_t *)pub_data, 8);
+    publish_position = false;
+  }
 
   update_servos();
 }
 
 short data[4];
 void mqtt_callback(char* topic, unsigned char* payload, unsigned int length) {
-  if (payload[0] == (unsigned char) CommandType::MOVE) {
+  if (payload[0] == (unsigned char) CommandType::READ) {
+    publish_position = true;
+  } else if (payload[0] == (unsigned char) CommandType::MOVE) {
     memcpy((void *)data, (void *)(payload+1), length-1);
     for (int i = 0; i < 3; ++i) {
       target_position[i] = data[i];
